@@ -3,24 +3,40 @@ package main
 import (
 	"fmt"
 	"io"
-	"log"
 	"net/http"
+	"os"
+	"regexp"
 	"strconv"
 	"strings"
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/miekg/dns"
+
+	log "github.com/sirupsen/logrus"
+)
+
+type ComicData uint8
+
+const (
+	ComicTitle ComicData = iota
+	ComicImageURL
+	ComicAltText
+	ComicAll
 )
 
 func main() {
+	log.SetOutput(os.Stdout)
+	log.SetFormatter(&log.JSONFormatter{})
+	log.SetLevel(log.InfoLevel)
+
 	server := &dns.Server{Addr: ":53", Net: "udp"}
 	dns.HandleFunc("xkcd.", handleXKCDRequest)
 
 	// Run the DNS Server
-	fmt.Println("Starting DNS Server")
+	log.Info("Starting DNS Server")
 	err := server.ListenAndServe()
 	if err != nil {
-		fmt.Println(err)
+		log.WithError(err).Fatal("DNS Server Shutdown")
 	}
 }
 
@@ -34,98 +50,132 @@ func handleXKCDRequest(w dns.ResponseWriter, m *dns.Msg) {
 	}
 
 	req := m.Question[0].Name
-	fmt.Println(req)
+	resp := new(dns.Msg)
+	resp.SetReply(m)
 
-	if req == "xkcd." {
-		// Display Random Comic
-		fmt.Println("Random Comic")
-		handleRandomComic(w, m)
+	err := parseRequest(req, m, resp)
+
+	if err != nil {
+		log.WithFields(log.Fields{
+			"question": m.Question[0].Name,
+			"remote":   w.RemoteAddr().String(),
+			"result":   resp.Rcode,
+			"answer":   resp.Answer,
+		}).WithError(err).Error("DNS Request")
 	} else {
-		breakdown := strings.Split(req[:len(req)-1], ".")
-		fmt.Println(breakdown, len(breakdown))
+		log.WithFields(log.Fields{
+			"question": m.Question[0].Name,
+			"remote":   w.RemoteAddr().String(),
+			"answer":   resp.Answer,
+		}).Info("DNS Request")
+	}
 
-		if len(breakdown) == 2 {
-			// Display Comic Number
-			fmt.Println("Comic Number")
+	// Write the response message
+	w.WriteMsg(resp)
+}
 
-			comicNum, err := strconv.Atoi(breakdown[0])
-			if err != nil {
-				fmt.Println(err)
-				handleRefused(w, m)
-				return
-			}
+func parseRequest(req string, m *dns.Msg, r *dns.Msg) error {
+	// Handle Random Request
+	switch req {
+	case "xkcd.":
+		// Display Random Comic
+		return handleRandomComic(m, ComicAll, r)
+	case "title.xkcd.":
+		return handleRandomComic(m, ComicTitle, r)
+	case "img.xkcd.":
+		return handleRandomComic(m, ComicImageURL, r)
+	case "alt.xkcd.":
+		return handleRandomComic(m, ComicAltText, r)
+	}
 
-			handleComicNumber(comicNum, w, m)
+	// Check if Valid Comic Number Request
+	regex := regexp.MustCompile(`^((title|img|alt)\.)?\d+\.xkcd\.`)
+	if !regex.MatchString(req) {
+		handleRefused(m, r)
+		return fmt.Errorf("invalid request: %s", req)
+	}
 
-		} else {
-			// Invalid Request
-			fmt.Println("Invalid Request")
-			handleRefused(w, m)
+	breakdown := strings.Split(req[:len(req)-1], ".")
+	if len(breakdown) == 2 {
+		comicNum, err := strconv.Atoi(breakdown[0])
+		if err != nil {
+			handleRefused(m, r)
+			return fmt.Errorf("invalid request: %s", req)
 		}
+
+		handleComicNumber(comicNum, m, ComicAll, r)
+	}
+
+	comicNum, err := strconv.Atoi(breakdown[1])
+	if err != nil {
+		handleRefused(m, r)
+		return err
+	}
+
+	switch breakdown[0] {
+	case "title":
+		return handleComicNumber(comicNum, m, ComicTitle, r)
+	case "img":
+		return handleComicNumber(comicNum, m, ComicImageURL, r)
+	case "alt":
+		return handleComicNumber(comicNum, m, ComicAltText, r)
+	default:
+		handleRefused(m, r)
+		return fmt.Errorf("invalid request: %s", req)
 	}
 }
 
-func handleRefused(w dns.ResponseWriter, m *dns.Msg) {
-
-	resp := new(dns.Msg)
-	resp.SetReply(m)
-	resp.SetRcode(m, dns.RcodeNameError)
-
-	w.WriteMsg(resp)
+func handleRefused(m *dns.Msg, r *dns.Msg) {
+	r.SetRcode(m, dns.RcodeNameError)
 }
-func handleServerError(w dns.ResponseWriter, m *dns.Msg) {
-
-	resp := new(dns.Msg)
-	resp.SetReply(m)
-	resp.SetRcode(m, dns.RcodeServerFailure)
-
-	w.WriteMsg(resp)
+func handleServerError(m *dns.Msg, r *dns.Msg) {
+	r.SetRcode(m, dns.RcodeServerFailure)
 }
 
-func handleComicNumber(num int, w dns.ResponseWriter, m *dns.Msg) {
+func handleComicNumber(num int, m *dns.Msg, d ComicData, r *dns.Msg) error {
 	// Make a GET request to fetch the comic page
 	response, err := http.Get(fmt.Sprintf("https://xkcd.com/%d/", num))
 	if err != nil {
-		fmt.Println(err)
-		handleServerError(w, m)
-		return
+		handleServerError(m, r)
+		return err
 	}
 	defer response.Body.Close()
 
 	// Check if the response was successful
 	if response.StatusCode != http.StatusOK {
-		handleRefused(w, m)
-		return
+		handleRefused(m, r)
+		return err
 	}
 
-	comicResponse(response.Body, w, m)
+	comicResponse(response.Body, m, d, r)
+	return nil
 }
 
-func handleRandomComic(w dns.ResponseWriter, m *dns.Msg) {
+func handleRandomComic(m *dns.Msg, d ComicData, r *dns.Msg) error {
 
 	// Make a GET request to fetch the comic page
 	response, err := http.Get("https://c.xkcd.com/random/comic/")
 	if err != nil {
-		fmt.Println(err)
-		handleServerError(w, m)
-		return
+		handleServerError(m, r)
+		return err
 	}
 	defer response.Body.Close()
 
 	// Check if the response was successful
 	if response.StatusCode != http.StatusOK {
-		handleRefused(w, m)
-		return
+		handleRefused(m, r)
+		return err
 	}
 
-	comicResponse(response.Body, w, m)
+	return comicResponse(response.Body, m, d, r)
 }
 
-func comicResponse(data io.Reader, w dns.ResponseWriter, m *dns.Msg) {
+func comicResponse(data io.Reader, m *dns.Msg, d ComicData, r *dns.Msg) error {
 	// Parse the response body using goquery
 	document, err := goquery.NewDocumentFromReader(data)
 	if err != nil {
-		log.Fatal(err)
+		handleServerError(m, r)
+		return err
 	}
 
 	// Find the comic image URL and alt text
@@ -133,23 +183,23 @@ func comicResponse(data io.Reader, w dns.ResponseWriter, m *dns.Msg) {
 	comicAltText := document.Find("#comic img").AttrOr("title", "")
 	comicTitle := document.Find("#ctitle").Text()
 
-	// Print the comic data
-	fmt.Printf("Comic Title: %s\n", comicTitle)
-	fmt.Printf("Alt Text: %s\n", comicAltText)
-
-	// Create a new DNS response message
-	resp := new(dns.Msg)
-	resp.SetReply(m)
-
 	// Add the TXT record to the response message
-	resp.Answer = append(resp.Answer,
-		buildResponse(m.Question[0].Name, comicTitle),
-		buildResponse(m.Question[0].Name, fmt.Sprintf("https:%s", comicImageURL)),
-		buildResponse(m.Question[0].Name, comicAltText),
-	)
+	switch d {
+	case ComicTitle:
+		r.Answer = append(r.Answer, buildResponse(m.Question[0].Name, comicTitle))
+	case ComicImageURL:
+		r.Answer = append(r.Answer, buildResponse(m.Question[0].Name, fmt.Sprintf("https:%s", comicImageURL)))
+	case ComicAltText:
+		r.Answer = append(r.Answer, buildResponse(m.Question[0].Name, comicAltText))
+	case ComicAll:
+		r.Answer = append(r.Answer,
+			buildResponse(m.Question[0].Name, comicTitle),
+			buildResponse(m.Question[0].Name, fmt.Sprintf("https:%s", comicImageURL)),
+			buildResponse(m.Question[0].Name, comicAltText),
+		)
+	}
 
-	// Write the response message
-	w.WriteMsg(resp)
+	return nil
 }
 
 func buildResponse(name, data string) dns.RR {
