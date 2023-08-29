@@ -50,7 +50,6 @@ func handleXKCDRequest(cache *Cache, w dns.ResponseWriter, m *dns.Msg) {
 	resp.SetReply(m)
 
 	err := parseRequest(cache, req, m, resp)
-
 	if err != nil {
 		log.WithFields(log.Fields{
 			"question": m.Question[0].Name,
@@ -67,7 +66,13 @@ func handleXKCDRequest(cache *Cache, w dns.ResponseWriter, m *dns.Msg) {
 	}
 
 	// Write the response message
-	w.WriteMsg(resp)
+	if err = w.WriteMsg(resp); err != nil {
+		log.WithFields(log.Fields{
+			"question": m.Question[0].Name,
+			"remote":   w.RemoteAddr().String(),
+			"answer":   resp.Answer,
+		}).WithError(err).Error("Failed to write response")
+	}
 }
 
 func parseRequest(cache *Cache, req string, m *dns.Msg, r *dns.Msg) error {
