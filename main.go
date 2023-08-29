@@ -24,6 +24,14 @@ const (
 	ComicAll
 )
 
+type Comic struct {
+	Title  string
+	Alt    string
+	Image  string
+}
+
+var comicCache map[int]Comic = make(map[int]Comic)
+
 func main() {
 	log.SetOutput(os.Stdout)
 	log.SetFormatter(&log.JSONFormatter{})
@@ -133,6 +141,11 @@ func handleServerError(m *dns.Msg, r *dns.Msg) {
 }
 
 func handleComicNumber(num int, m *dns.Msg, d ComicData, r *dns.Msg) error {
+
+	if _, ok := comicCache[num]; ok {
+		return comicResponse(m.Question[0].Name, comicCache[num], d, r)
+	}
+
 	// Make a GET request to fetch the comic page
 	response, err := http.Get(fmt.Sprintf("https://xkcd.com/%d/", num))
 	if err != nil {
@@ -147,8 +160,13 @@ func handleComicNumber(num int, m *dns.Msg, d ComicData, r *dns.Msg) error {
 		return err
 	}
 
-	comicResponse(response.Body, m, d, r)
-	return nil
+	comic, err := comicExtract(response.Body)
+	if err != nil {
+		handleServerError(m, r)
+		return err
+	}
+
+	return comicResponse(m.Question[0].Name, comic, d, r)
 }
 
 func handleRandomComic(m *dns.Msg, d ComicData, r *dns.Msg) error {
@@ -167,15 +185,20 @@ func handleRandomComic(m *dns.Msg, d ComicData, r *dns.Msg) error {
 		return err
 	}
 
-	return comicResponse(response.Body, m, d, r)
-}
-
-func comicResponse(data io.Reader, m *dns.Msg, d ComicData, r *dns.Msg) error {
-	// Parse the response body using goquery
-	document, err := goquery.NewDocumentFromReader(data)
+	comic, err := comicExtract(response.Body)
 	if err != nil {
 		handleServerError(m, r)
 		return err
+	}
+
+	return comicResponse(m.Question[0].Name, comic, d, r)
+}
+
+func comicExtract(data io.Reader) (Comic, error) {
+	// Parse the response body using goquery
+	document, err := goquery.NewDocumentFromReader(data)
+	if err != nil {
+		return Comic{}, err
 	}
 
 	// Find the comic image URL and alt text
@@ -183,19 +206,64 @@ func comicResponse(data io.Reader, m *dns.Msg, d ComicData, r *dns.Msg) error {
 	comicAltText := document.Find("#comic img").AttrOr("title", "")
 	comicTitle := document.Find("#ctitle").Text()
 
+
+	// Find the comic number
+	comicNum := 0
+	metaTag := document.Find(`meta[property="og:url"]`)
+	for _, n := range metaTag.Nodes {
+		for _, a := range n.Attr {
+			if a.Key == "content" {
+				// Extract the comic number from the URL
+				// https://xkcd.com/614/ -> 614
+				split := strings.Split(a.Val, "/")
+				if len(split) != 5 {
+					continue
+				}
+
+				comicNum, err = strconv.Atoi(strings.Split(a.Val, "/")[3])
+				if err != nil {
+					continue
+				}
+
+				break
+			}
+		}
+	}
+
+	if comicNum == 0 {
+		return Comic{}, fmt.Errorf("unable to extract comic number")
+	}
+
+	// Cache the Comic Data
+	if _, ok := comicCache[comicNum]; !ok {
+		comicCache[comicNum] = Comic{
+			Title:  comicTitle,
+			Alt:    comicAltText,
+			Image:  fmt.Sprintf("https:%s", comicImageURL),
+		}
+		log.Infof("Cached Comic %d", comicNum)
+	} else {
+		log.Infoln("Comic already cached")
+	}
+	
+	return comicCache[comicNum], nil
+}
+
+func comicResponse(domain string, comic Comic, d ComicData, r *dns.Msg) error {
+
 	// Add the TXT record to the response message
 	switch d {
 	case ComicTitle:
-		r.Answer = append(r.Answer, buildResponse(m.Question[0].Name, comicTitle))
+		r.Answer = append(r.Answer, buildResponse(domain, comic.Title))
 	case ComicImageURL:
-		r.Answer = append(r.Answer, buildResponse(m.Question[0].Name, fmt.Sprintf("https:%s", comicImageURL)))
+		r.Answer = append(r.Answer, buildResponse(domain, comic.Image))
 	case ComicAltText:
-		r.Answer = append(r.Answer, buildResponse(m.Question[0].Name, comicAltText))
+		r.Answer = append(r.Answer, buildResponse(domain, comic.Alt))
 	case ComicAll:
 		r.Answer = append(r.Answer,
-			buildResponse(m.Question[0].Name, comicTitle),
-			buildResponse(m.Question[0].Name, fmt.Sprintf("https:%s", comicImageURL)),
-			buildResponse(m.Question[0].Name, comicAltText),
+			buildResponse(domain, comic.Title),
+			buildResponse(domain, comic.Image),
+			buildResponse(domain, comic.Alt),
 		)
 	}
 
